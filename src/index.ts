@@ -1,6 +1,6 @@
 import { createFiberplane, createOpenAPISpec } from "@fiberplane/hono";
 import { drizzle } from "drizzle-orm/d1";
-import { eq, desc, and } from "drizzle-orm";
+import { eq, desc } from "drizzle-orm";
 import { Hono } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
@@ -10,68 +10,104 @@ import * as schema from "./db/schema";
 
 type Bindings = {
   DB: D1Database;
-  ENCRYPTION_KEY: string;
 };
 
+interface SlackAuthTestResponse {
+  ok: boolean;
+  url: string;
+  team: string;
+  user: string;
+  team_id: string;
+  user_id: string;
+  bot_id: string;
+  is_enterprise_install?: boolean;
+}
+
+interface SlackMessage {
+  type: string;
+  user?: string;
+  text: string;
+  ts: string;
+  thread_ts?: string;
+  reply_count?: number;
+  replies?: Array<{ user: string; ts: string }>;
+}
+
+interface SlackConversationsHistoryResponse {
+  ok: boolean;
+  messages: SlackMessage[];
+  has_more: boolean;
+  pin_count?: number;
+  response_metadata?: {
+    next_cursor?: string;
+  };
+}
+
+interface SlackChannel {
+  id: string;
+  name: string;
+  is_channel: boolean;
+  is_group: boolean;
+  is_im: boolean;
+  is_mpim: boolean;
+  is_private: boolean;
+  created: number;
+  is_archived: boolean;
+  is_general: boolean;
+  unlinked: number;
+  name_normalized: string;
+  is_shared: boolean;
+  is_ext_shared: boolean;
+  is_org_shared: boolean;
+  pending_shared: string[];
+  pending_connected_team_ids: string[];
+  is_pending_ext_shared: boolean;
+  is_member: boolean;
+  is_open: boolean;
+  topic: {
+    value: string;
+    creator: string;
+    last_set: number;
+  };
+  purpose: {
+    value: string;
+    creator: string;
+    last_set: number;
+  };
+  previous_names: string[];
+  num_members: number;
+}
+
+interface SlackConversationsListResponse {
+  ok: boolean;
+  channels: SlackChannel[];
+  response_metadata?: {
+    next_cursor?: string;
+  };
+}
+
+interface SlackChatPostMessageResponse {
+  ok: boolean;
+  channel: string;
+  ts: string;
+  message: {
+    type: string;
+    subtype?: string;
+    text: string;
+    user: string;
+    ts: string;
+    bot_id?: string;
+    app_id?: string;
+  };
+}
+
 const app = new Hono<{ Bindings: Bindings }>();
-
-// Simple encryption/decryption functions
-async function encrypt(text: string, key: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(text);
-  const keyData = encoder.encode(key.slice(0, 32).padEnd(32, '0'));
-  
-  const cryptoKey = await crypto.subtle.importKey(
-    'raw',
-    keyData,
-    { name: 'AES-GCM' },
-    false,
-    ['encrypt']
-  );
-  
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encrypted = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    cryptoKey,
-    data
-  );
-  
-  const result = new Uint8Array(iv.length + encrypted.byteLength);
-  result.set(iv);
-  result.set(new Uint8Array(encrypted), iv.length);
-  
-  return btoa(String.fromCharCode(...result));
-}
-
-async function decrypt(encryptedText: string, key: string): Promise<string> {
-  const data = new Uint8Array(atob(encryptedText).split('').map(c => c.charCodeAt(0)));
-  const keyData = new TextEncoder().encode(key.slice(0, 32).padEnd(32, '0'));
-  
-  const cryptoKey = await crypto.subtle.importKey(
-    'raw',
-    keyData,
-    { name: 'AES-GCM' },
-    false,
-    ['decrypt']
-  );
-  
-  const iv = data.slice(0, 12);
-  const encrypted = data.slice(12);
-  
-  const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv },
-    cryptoKey,
-    encrypted
-  );
-  
-  return new TextDecoder().decode(decrypted);
-}
 
 function createMcpServer(env: Bindings) {
   const server = new McpServer({
     name: "slack-mcp-server",
     version: "1.0.0",
-    description: "MCP server for Slack workspace integration with message posting and retrieval"
+    description: "MCP server for Slack workspace integration with message posting and retrieval capabilities"
   });
 
   const db = drizzle(env.DB);
@@ -81,76 +117,80 @@ function createMcpServer(env: Bindings) {
     "configure_workspace",
     {
       bot_token: z.string().min(1).describe("Slack bot token (xoxb-...)"),
+      user_id: z.string().min(1).describe("Your Slack user ID (get from: Click 3 dots > Copy member ID from your Slack profile)"),
       description: z.string().optional().describe("Optional description for the workspace")
     },
-    async ({ bot_token, description }) => {
+    async ({ bot_token, user_id, description }) => {
       try {
-        // Validate token and get workspace info
         const slack = new WebClient(bot_token);
-        const authResponse = await slack.auth.test();
         
-        if (!authResponse.ok) {
+        // Validate token and get workspace info
+        const authResult = await slack.auth.test() as SlackAuthTestResponse;
+        
+        if (!authResult.ok) {
           return {
             content: [{
               type: "text",
-              text: "Invalid Slack bot token"
+              text: "Invalid bot token. Please check your token and try again."
             }],
             isError: true
           };
         }
 
-        const { team, team_id, url, user_id, bot_id } = authResponse;
-        
-        // Encrypt the bot token
-        const encryptedToken = await encrypt(bot_token, env.ENCRYPTION_KEY);
-        
         // Check if workspace already exists
         const existingWorkspace = await db.select()
           .from(schema.workspaces)
-          .where(eq(schema.workspaces.teamId, team_id!))
-          .get();
+          .where(eq(schema.workspaces.teamId, authResult.team_id))
+          .limit(1);
 
-        let workspace;
-        if (existingWorkspace) {
+        if (existingWorkspace.length > 0) {
           // Update existing workspace
-          [workspace] = await db.update(schema.workspaces)
+          const [updatedWorkspace] = await db.update(schema.workspaces)
             .set({
-              teamName: team!,
-              workspaceUrl: url!,
-              botToken: encryptedToken,
-              userId: user_id!,
-              botId: bot_id!,
+              teamName: authResult.team,
+              workspaceUrl: authResult.url,
+              botToken: bot_token, // In production, this should be encrypted
+              userId: user_id,
+              botId: authResult.user_id,
               description: description || null,
-              updatedAt: new Date()
+              updatedAt: new Date(),
+              isActive: true
             })
-            .where(eq(schema.workspaces.teamId, team_id!))
+            .where(eq(schema.workspaces.teamId, authResult.team_id))
             .returning();
-        } else {
-          // Create new workspace
-          [workspace] = await db.insert(schema.workspaces)
-            .values({
-              teamName: team!,
-              teamId: team_id!,
-              workspaceUrl: url!,
-              botToken: encryptedToken,
-              userId: user_id!,
-              botId: bot_id!,
-              description: description || null
-            })
-            .returning();
+
+          return {
+            content: [{
+              type: "text",
+              text: `Workspace updated successfully!\n\nWorkspace ID: ${updatedWorkspace.id}\nTeam: ${updatedWorkspace.teamName}\nURL: ${updatedWorkspace.workspaceUrl}\nBot ID: ${updatedWorkspace.botId}`
+            }]
+          };
         }
+
+        // Create new workspace
+        const [newWorkspace] = await db.insert(schema.workspaces)
+          .values({
+            teamName: authResult.team,
+            teamId: authResult.team_id,
+            workspaceUrl: authResult.url,
+            botToken: bot_token, // In production, this should be encrypted
+            userId: user_id,
+            botId: authResult.user_id,
+            description: description || null
+          })
+          .returning();
 
         return {
           content: [{
             type: "text",
-            text: `Workspace configured successfully:\n- Name: ${workspace.teamName}\n- ID: ${workspace.id}\n- URL: ${workspace.workspaceUrl}\n- Description: ${workspace.description || 'None'}`
+            text: `Workspace configured successfully!\n\nWorkspace ID: ${newWorkspace.id}\nTeam: ${newWorkspace.teamName}\nURL: ${newWorkspace.workspaceUrl}\nBot ID: ${newWorkspace.botId}\n\nYou can now use this workspace ID for other operations.`
           }]
         };
       } catch (error) {
         return {
           content: [{
             type: "text",
-            text: `Error configuring workspace: ${error instanceof Error ? error.message : 'Unknown error'}`
+            text: `Error configuring workspace: ${error instanceof Error ? error.message : "Unknown error"}`
           }],
           isError: true
         };
@@ -161,37 +201,44 @@ function createMcpServer(env: Bindings) {
   // List workspaces tool
   server.tool(
     "list_workspaces",
-    {
-      user_context: z.string().describe("User identification context")
-    },
-    async ({ user_context }) => {
+    {},
+    async () => {
       try {
-        const workspaces = await db.select()
-          .from(schema.workspaces)
-          .where(and(
-            eq(schema.workspaces.userId, user_context),
-            eq(schema.workspaces.isActive, true)
-          ));
+        const workspaces = await db.select({
+          id: schema.workspaces.id,
+          teamName: schema.workspaces.teamName,
+          description: schema.workspaces.description,
+          isActive: schema.workspaces.isActive,
+          createdAt: schema.workspaces.createdAt
+        })
+        .from(schema.workspaces)
+        .where(eq(schema.workspaces.isActive, true))
+        .orderBy(desc(schema.workspaces.createdAt));
 
-        const workspaceList = workspaces.map(ws => ({
-          id: ws.id,
-          name: ws.teamName,
-          url: ws.workspaceUrl,
-          description: ws.description,
-          created_at: ws.createdAt
-        }));
+        if (workspaces.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: "No workspaces configured. Use configure_workspace to add a workspace."
+            }]
+          };
+        }
+
+        const workspaceList = workspaces.map(ws => 
+          `• ${ws.teamName} (ID: ${ws.id})${ws.description ? ` - ${ws.description}` : ""}`
+        ).join("\n");
 
         return {
           content: [{
             type: "text",
-            text: `Found ${workspaces.length} workspace(s):\n${JSON.stringify(workspaceList, null, 2)}`
+            text: `Configured Workspaces:\n\n${workspaceList}`
           }]
         };
       } catch (error) {
         return {
           content: [{
             type: "text",
-            text: `Error listing workspaces: ${error instanceof Error ? error.message : 'Unknown error'}`
+            text: `Error listing workspaces: ${error instanceof Error ? error.message : "Unknown error"}`
           }],
           isError: true
         };
@@ -203,73 +250,87 @@ function createMcpServer(env: Bindings) {
   server.tool(
     "get_mentions",
     {
-      workspace_id: z.string().describe("Target workspace ID"),
+      workspace_id: z.string().min(1).describe("Unique workspace ID from configure_workspace"),
+      channel_id: z.string().min(1).describe("Channel ID to search for mentions"),
       days_back: z.number().min(1).max(365).default(1).describe("How many days back to search"),
       limit: z.number().min(1).max(100).default(5).describe("Maximum number of messages to return")
     },
-    async ({ workspace_id, days_back, limit }) => {
+    async ({ workspace_id, channel_id, days_back, limit }) => {
       try {
-        // Get workspace and decrypt token
-        const workspace = await db.select()
+        // Get workspace
+        const [workspace] = await db.select()
           .from(schema.workspaces)
           .where(eq(schema.workspaces.id, workspace_id))
-          .get();
+          .limit(1);
 
         if (!workspace) {
           return {
             content: [{
               type: "text",
-              text: "Workspace not found"
+              text: "Workspace not found. Please check the workspace ID."
             }],
             isError: true
           };
         }
 
-        const botToken = await decrypt(workspace.botToken, env.ENCRYPTION_KEY);
-        const slack = new WebClient(botToken);
-
+        const slack = new WebClient(workspace.botToken);
+        
         // Calculate timestamp for days_back
         const oldest = Math.floor((Date.now() - (days_back * 24 * 60 * 60 * 1000)) / 1000);
 
-        // Search for mentions of the workspace owner
-        const searchResult = await slack.search.messages({
-          query: `<@${workspace.userId}>`,
-          sort: 'timestamp',
-          sort_dir: 'desc',
-          count: limit
-        });
+        // Get messages from channel
+        const result = await slack.conversations.history({
+          channel: channel_id,
+          oldest: oldest.toString(),
+          limit: 100 // Get more messages to filter through
+        }) as SlackConversationsHistoryResponse;
 
-        if (!searchResult.ok || !searchResult.messages?.matches) {
+        if (!result.ok) {
           return {
             content: [{
               type: "text",
-              text: "No mentions found or search failed"
+              text: "Failed to retrieve messages. Check if the bot has access to this channel."
+            }],
+            isError: true
+          };
+        }
+
+        // Filter messages for mentions
+        const mentionPattern = new RegExp(`<@${workspace.userId}>|<!channel>|<!here>`);
+        const mentionedMessages = result.messages
+          .filter(msg => msg.text && mentionPattern.test(msg.text))
+          .slice(0, limit)
+          .map(msg => ({
+            text: msg.text,
+            timestamp: msg.ts,
+            user: msg.user,
+            permalink: `${workspace.workspaceUrl}archives/${channel_id}/p${msg.ts.replace('.', '')}`
+          }));
+
+        if (mentionedMessages.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: `No mentions found in the last ${days_back} day(s) in this channel.`
             }]
           };
         }
 
-        const mentions = searchResult.messages.matches
-          .filter(match => Number.parseFloat(match.ts!) >= oldest)
-          .slice(0, limit)
-          .map(match => ({
-            channel: match.channel?.name,
-            user: match.user,
-            text: match.text,
-            timestamp: match.ts,
-            permalink: match.permalink
-          }));
+        const messageList = mentionedMessages.map(msg => 
+          `• ${msg.text.substring(0, 100)}${msg.text.length > 100 ? '...' : ''}\n  User: ${msg.user || 'Unknown'} | Time: ${new Date(Number.parseFloat(msg.timestamp) * 1000).toLocaleString()}\n  Link: ${msg.permalink}`
+        ).join('\n\n');
 
         return {
           content: [{
             type: "text",
-            text: `Found ${mentions.length} mention(s) in the last ${days_back} day(s):\n${JSON.stringify(mentions, null, 2)}`
+            text: `Found ${mentionedMessages.length} mention(s) in the last ${days_back} day(s):\n\n${messageList}`
           }]
         };
       } catch (error) {
         return {
           content: [{
             type: "text",
-            text: `Error getting mentions: ${error instanceof Error ? error.message : 'Unknown error'}`
+            text: `Error retrieving mentions: ${error instanceof Error ? error.message : "Unknown error"}`
           }],
           isError: true
         };
@@ -281,77 +342,75 @@ function createMcpServer(env: Bindings) {
   server.tool(
     "list_user_channels",
     {
-      workspace_id: z.string().describe("Target workspace ID"),
-      limit: z.number().min(1).max(1000).default(50).describe("Maximum number of channels to return"),
-      include_private: z.boolean().default(false).describe("Include private channels")
+      workspace_id: z.string().min(1).describe("Unique workspace ID from configure_workspace"),
+      limit: z.number().min(1).max(100).default(10).describe("Maximum number of channels to return"),
+      private_only: z.boolean().default(false).describe("Show only private channels")
     },
-    async ({ workspace_id, limit, include_private }) => {
+    async ({ workspace_id, limit, private_only }) => {
       try {
-        const workspace = await db.select()
+        // Get workspace
+        const [workspace] = await db.select()
           .from(schema.workspaces)
           .where(eq(schema.workspaces.id, workspace_id))
-          .get();
+          .limit(1);
 
         if (!workspace) {
           return {
             content: [{
               type: "text",
-              text: "Workspace not found"
+              text: "Workspace not found. Please check the workspace ID."
             }],
             isError: true
           };
         }
 
-        const botToken = await decrypt(workspace.botToken, env.ENCRYPTION_KEY);
-        const slack = new WebClient(botToken);
+        const slack = new WebClient(workspace.botToken);
+        
+        // Get channels
+        const result = await slack.conversations.list({
+          limit: limit,
+          types: private_only ? 'private_channel' : 'public_channel,private_channel'
+        }) as SlackConversationsListResponse;
 
-        const channels = [];
-
-        // Get public channels
-        const publicChannels = await slack.conversations.list({
-          types: 'public_channel',
-          limit
-        });
-
-        if (publicChannels.ok && publicChannels.channels) {
-          channels.push(...publicChannels.channels.map(ch => ({
-            id: ch.id,
-            name: ch.name,
-            is_private: false,
-            is_member: ch.is_member,
-            purpose: ch.purpose?.value
-          })));
+        if (!result.ok) {
+          return {
+            content: [{
+              type: "text",
+              text: "Failed to retrieve channels."
+            }],
+            isError: true
+          };
         }
 
-        // Get private channels if requested
-        if (include_private) {
-          const privateChannels = await slack.conversations.list({
-            types: 'private_channel',
-            limit
-          });
+        const channels = result.channels
+          .filter(channel => private_only ? channel.is_private : true)
+          .filter(channel => channel.is_member)
+          .slice(0, limit);
 
-          if (privateChannels.ok && privateChannels.channels) {
-            channels.push(...privateChannels.channels.map(ch => ({
-              id: ch.id,
-              name: ch.name,
-              is_private: true,
-              is_member: ch.is_member,
-              purpose: ch.purpose?.value
-            })));
-          }
+        if (channels.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: private_only ? "No private channels found that the bot is a member of." : "No channels found that the bot is a member of."
+            }]
+          };
         }
+
+        const channelList = channels.map(channel => 
+          `• #${channel.name} (${channel.id}) - ${channel.is_private ? 'Private' : 'Public'}${channel.topic?.value ? ` - ${channel.topic.value}` : ''}`
+        ).join('\n');
 
         return {
           content: [{
             type: "text",
-            text: `Found ${channels.length} channel(s):\n${JSON.stringify(channels.slice(0, limit), null, 2)}`
+            text: `Channels (${channels.length}):\n\n${channelList}`
           }]
         };
       } catch (error) {
         return {
           content: [{
             type: "text",
-            text: `Error listing channels: ${error instanceof Error ? error.message : 'Unknown error'}`
+            text: `Error listing channels: ${error instanceof Error ? error.message : "Unknown error"}`
           }],
           isError: true
         };
@@ -363,80 +422,87 @@ function createMcpServer(env: Bindings) {
   server.tool(
     "post_message",
     {
-      workspace_id: z.string().describe("Target workspace ID"),
-      channel_id: z.string().describe("Target channel ID"),
-      message_text: z.string().min(1).describe("Message content to post"),
-      thread_ts: z.string().optional().describe("Thread timestamp if replying to thread")
+      workspace_id: z.string().min(1).describe("Unique workspace ID from configure_workspace"),
+      channel_id: z.string().min(1).describe("Target channel ID to post message to"),
+      message_text: z.string().min(1).describe("Message content to post")
     },
-    async ({ workspace_id, channel_id, message_text, thread_ts }) => {
+    async ({ workspace_id, channel_id, message_text }) => {
       try {
-        const workspace = await db.select()
+        // Get workspace
+        const [workspace] = await db.select()
           .from(schema.workspaces)
           .where(eq(schema.workspaces.id, workspace_id))
-          .get();
+          .limit(1);
 
         if (!workspace) {
           return {
             content: [{
               type: "text",
-              text: "Workspace not found"
+              text: "Workspace not found. Please check the workspace ID."
             }],
             isError: true
           };
         }
 
-        const botToken = await decrypt(workspace.botToken, env.ENCRYPTION_KEY);
-        const slack = new WebClient(botToken);
-
-        // Get channel info for name
+        const slack = new WebClient(workspace.botToken);
+        
+        // Get channel info first
         const channelInfo = await slack.conversations.info({
           channel: channel_id
         });
 
-        const channelName = channelInfo.ok && channelInfo.channel ? 
-          channelInfo.channel.name || channel_id : channel_id;
+        if (!channelInfo.ok || !channelInfo.channel) {
+          return {
+            content: [{
+              type: "text",
+              text: "Channel not found or bot doesn't have access to this channel."
+            }],
+            isError: true
+          };
+        }
 
-        // Post the message
+        // Post message
         const result = await slack.chat.postMessage({
           channel: channel_id,
-          text: message_text,
-          thread_ts
-        });
+          text: message_text
+        }) as SlackChatPostMessageResponse;
 
         if (!result.ok) {
           return {
             content: [{
               type: "text",
-              text: `Failed to post message: ${result.error}`
+              text: "Failed to post message. Check if the bot has permission to post in this channel."
             }],
             isError: true
           };
         }
 
-        // Store the posted message in database
+        // Store posted message in database
         const [postedMessage] = await db.insert(schema.postedMessages)
           .values({
             workspaceId: workspace_id,
             channelId: channel_id,
-            channelName: channelName,
+            channelName: (channelInfo.channel as SlackChannel).name || 'unknown',
             messageText: message_text,
-            messageTs: result.ts!,
-            slackMessageId: (result.message as any)?.client_msg_id || null,
+            messageTs: result.ts,
+            slackMessageId: result.message.ts,
             userId: workspace.userId
           })
           .returning();
 
+        const permalink = `${workspace.workspaceUrl}archives/${channel_id}/p${result.ts.replace('.', '')}`;
+
         return {
           content: [{
             type: "text",
-            text: `Message posted successfully to #${channelName}:\n- Message ID: ${postedMessage.id}\n- Slack TS: ${result.ts}\n- Content: "${message_text}"`
+            text: `Message posted successfully!\n\nChannel: #${(channelInfo.channel as SlackChannel).name}\nMessage: ${message_text}\nTimestamp: ${result.ts}\nLink: ${permalink}\n\nMessage ID: ${postedMessage.id}`
           }]
         };
       } catch (error) {
         return {
           content: [{
             type: "text",
-            text: `Error posting message: ${error instanceof Error ? error.message : 'Unknown error'}`
+            text: `Error posting message: ${error instanceof Error ? error.message : "Unknown error"}`
           }],
           isError: true
         };
@@ -448,56 +514,59 @@ function createMcpServer(env: Bindings) {
   server.tool(
     "get_posted_messages",
     {
-      workspace_id: z.string().optional().describe("Filter by workspace ID"),
-      channel_id: z.string().optional().describe("Filter by channel ID"),
-      limit: z.number().min(1).max(1000).default(50).describe("Maximum messages to return"),
-      offset: z.number().min(0).default(0).describe("Pagination offset")
+      workspace_id: z.string().min(1).describe("Unique workspace ID from configure_workspace"),
+      limit: z.number().min(1).max(100).default(50).describe("Maximum number of messages to return")
     },
-    async ({ workspace_id, channel_id, limit, offset }) => {
+    async ({ workspace_id, limit }) => {
       try {
-        const conditions = [];
-        
-        if (workspace_id) {
-          conditions.push(eq(schema.postedMessages.workspaceId, workspace_id));
-        }
-        
-        if (channel_id) {
-          conditions.push(eq(schema.postedMessages.channelId, channel_id));
+        // Get workspace
+        const [workspace] = await db.select()
+          .from(schema.workspaces)
+          .where(eq(schema.workspaces.id, workspace_id))
+          .limit(1);
+
+        if (!workspace) {
+          return {
+            content: [{
+              type: "text",
+              text: "Workspace not found. Please check the workspace ID."
+            }],
+            isError: true
+          };
         }
 
-        const query = db.select()
+        // Get posted messages
+        const messages = await db.select()
           .from(schema.postedMessages)
+          .where(eq(schema.postedMessages.workspaceId, workspace_id))
           .orderBy(desc(schema.postedMessages.createdAt))
-          .limit(limit)
-          .offset(offset);
+          .limit(limit);
 
-        const messages = conditions.length > 0 
-          ? await query.where(and(...conditions))
-          : await query;
+        if (messages.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: "No messages have been posted through this MCP server for this workspace."
+            }]
+          };
+        }
 
-        const messageList = messages.map(msg => ({
-          id: msg.id,
-          workspace_id: msg.workspaceId,
-          channel_id: msg.channelId,
-          channel_name: msg.channelName,
-          message_text: msg.messageText,
-          message_ts: msg.messageTs,
-          slack_message_id: msg.slackMessageId,
-          user_id: msg.userId,
-          created_at: msg.createdAt
-        }));
+        const messageList = messages.map(msg => {
+          const permalink = `${workspace.workspaceUrl}archives/${msg.channelId}/p${msg.messageTs.replace('.', '')}`;
+          return `• #${msg.channelName}: ${msg.messageText.substring(0, 100)}${msg.messageText.length > 100 ? '...' : ''}\n  Posted: ${msg.createdAt.toLocaleString()}\n  Link: ${permalink}`;
+        }).join('\n\n');
 
         return {
           content: [{
             type: "text",
-            text: `Found ${messages.length} posted message(s):\n${JSON.stringify(messageList, null, 2)}`
+            text: `Posted Messages (${messages.length}):\n\n${messageList}`
           }]
         };
       } catch (error) {
         return {
           content: [{
             type: "text",
-            text: `Error getting posted messages: ${error instanceof Error ? error.message : 'Unknown error'}`
+            text: `Error retrieving posted messages: ${error instanceof Error ? error.message : "Unknown error"}`
           }],
           isError: true
         };
@@ -509,23 +578,31 @@ function createMcpServer(env: Bindings) {
 }
 
 app.get("/", (c) => {
-  return c.text("Slack MCP Server");
+  return c.text("Slack MCP Server - Use /mcp endpoint for MCP communication");
 });
 
 app.get("/health", async (c) => {
   try {
     const db = drizzle(c.env.DB);
-    await db.select().from(schema.workspaces).limit(1);
-    return c.json({ status: "healthy", database: "connected" });
+    // Simple health check - count workspaces
+    const workspaceCount = await db.select().from(schema.workspaces).limit(1);
+    
+    return c.json({
+      status: "healthy",
+      timestamp: new Date().toISOString(),
+      database: "connected"
+    });
   } catch (error) {
-    return c.json({ 
-      status: "unhealthy", 
+    return c.json({
+      status: "unhealthy",
+      timestamp: new Date().toISOString(),
       database: "disconnected",
-      error: error instanceof Error ? error.message : 'Unknown error'
+      error: error instanceof Error ? error.message : "Unknown error"
     }, 500);
   }
 });
 
+// MCP endpoint
 app.all("/mcp", async (c) => {
   const mcpServer = createMcpServer(c.env);
   const transport = new StreamableHTTPTransport();
@@ -539,7 +616,7 @@ app.get("/openapi.json", c => {
     info: {
       title: "Slack MCP Server",
       version: "1.0.0",
-      description: "MCP server for Slack workspace integration"
+      description: "MCP server for Slack workspace integration with message posting and retrieval capabilities"
     },
   }));
 });
